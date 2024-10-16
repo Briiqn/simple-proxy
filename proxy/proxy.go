@@ -220,7 +220,7 @@ func (p *ProxyHandler) handleTunneling(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *ProxyHandler) reuseConnection(w http.ResponseWriter, r *http.Request, cachedConn *net.Conn) error {
-	fmt.Printf("Using cached connection")
+	fmt.Printf("Using cached connection\n")
 	(*cachedConn).SetReadDeadline(time.Now())
 	_, err := (*cachedConn).Read(make([]byte, 0))
 	(*cachedConn).SetReadDeadline(time.Time{})
