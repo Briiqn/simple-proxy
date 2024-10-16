@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/golang/glog"
 	"github.com/jthomperoo/simple-proxy/proxy"
@@ -63,39 +62,30 @@ func main() {
 		glog.Fatalf("If using HTTPS protocol --cert and --key are required\n")
 	}
 
-	var handler http.Handler
-	if basicAuth == "" {
-		handler = &proxy.ProxyHandler{
-			Timeout:    time.Duration(timeoutSecs) * time.Second,
-			LogAuth:    logAuth,
-			LogHeaders: logHeaders,
-		}
-	} else {
+	handler := proxy.NewProxyHandler(timeoutSecs)
+	handler.LogAuth = logAuth
+	handler.LogHeaders = logHeaders
+
+	if basicAuth != "" {
 		parts := strings.Split(basicAuth, ":")
 		if len(parts) < 2 {
 			glog.Fatalf("Invalid basic auth provided, must be in format 'username:password', auth: %s\n", basicAuth)
 		}
-		handler = &proxy.ProxyHandler{
-			Timeout:    time.Duration(timeoutSecs) * time.Second,
-			Username:   &parts[0],
-			Password:   &parts[1],
-			LogAuth:    logAuth,
-			LogHeaders: logHeaders,
-		}
+		handler.Username = &parts[0]
+		handler.Password = &parts[1]
 	}
 
 	server := &http.Server{
-		Addr:    fmt.Sprintf("%s:%s", bind, port),
-		Handler: handler,
-		// Disable HTTP/2.
+		Addr:         fmt.Sprintf("%s:%s", bind, port),
+		Handler:      handler,
 		TLSNextProto: make(map[string]func(*http.Server, *tls.Conn, http.Handler)),
 	}
 
 	if protocol == httpProtocol {
-		glog.V(0).Infoln("Starting HTTP proxy...")
+		glog.V(0).Infoln("Starting HTTP proxy")
 		log.Fatal(server.ListenAndServe())
 	} else {
-		glog.V(0).Infoln("Starting HTTPS proxy...")
+		glog.V(0).Infoln("Starting HTTPS")
 		log.Fatal(server.ListenAndServeTLS(certPath, keyPath))
 	}
 }
