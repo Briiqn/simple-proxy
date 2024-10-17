@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"github.com/pquerna/cachecontrol"
 	"io"
+	"math/rand"
 	"net"
 	"net/http"
 	"strings"
@@ -13,10 +15,95 @@ import (
 	"time"
 
 	"github.com/hashicorp/golang-lru/v2"
-	"github.com/pquerna/cachecontrol"
 	"golang.org/x/net/http2"
 	"golang.org/x/sync/semaphore"
 )
+
+var (
+	androidUserAgents = []string{
+		"Mozilla/5.0 (Linux; Android 12; SM-S908B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36",
+		"Mozilla/5.0 (Linux; Android 13; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36",
+		"Mozilla/5.0 (Linux; Android 13; SM-A536B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36",
+	}
+
+	iosUserAgents = []string{
+		"Mozilla/5.0 (iPhone; CPU iPhone OS 16_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1",
+		"Mozilla/5.0 (iPhone; CPU iPhone OS 16_3_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.3 Mobile/15E148 Safari/604.1",
+		"Mozilla/5.0 (iPad; CPU OS 16_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Mobile/15E148 Safari/604.1",
+	}
+
+	windowsUserAgents = []string{
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Edge/112.0.1722.64",
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/112.0",
+	}
+
+	macUserAgents = []string{
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 13_3_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 13_3_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.4 Safari/605.1.15",
+		"Mozilla/5.0 (Macintosh; Intel Mac OS X 13.3; rv:109.0) Gecko/20100101 Firefox/112.0",
+	}
+)
+
+type HeaderAnonymizer struct {
+	rng *rand.Rand
+}
+
+func NewHeaderAnonymizer() *HeaderAnonymizer {
+	return &HeaderAnonymizer{
+		rng: rand.New(rand.NewSource(time.Now().UnixNano())),
+	}
+}
+
+func (ha *HeaderAnonymizer) getRandomUserAgent(originalUA string) string {
+	originalUA = strings.ToLower(originalUA)
+
+	switch {
+	case strings.Contains(originalUA, "android"):
+		return androidUserAgents[ha.rng.Intn(len(androidUserAgents))]
+	case strings.Contains(originalUA, "iphone") || strings.Contains(originalUA, "ipad") || strings.Contains(originalUA, "ios"):
+		return iosUserAgents[ha.rng.Intn(len(iosUserAgents))]
+	case strings.Contains(originalUA, "windows"):
+		return windowsUserAgents[ha.rng.Intn(len(windowsUserAgents))]
+	case strings.Contains(originalUA, "macintosh") || strings.Contains(originalUA, "mac os"):
+		return macUserAgents[ha.rng.Intn(len(macUserAgents))]
+	default:
+		return windowsUserAgents[ha.rng.Intn(len(windowsUserAgents))]
+	}
+}
+
+func (ha *HeaderAnonymizer) anonymizeHeaders(headers http.Header) http.Header {
+	cleaned := make(http.Header)
+
+	for key, values := range headers {
+		key = strings.ToLower(key)
+
+		switch key {
+		case "cookie", "x-forwarded-for", "forwarded", "via", "referer", "origin",
+			"true-client-ip", "x-real-ip", "cf-connecting-ip", "fastly-client-ip",
+			"x-bb-ip", "x-client-ip", "x-cluster-client-ip", "x-forwarded",
+			"x-forwarded-host", "x-fingerprint", "x-device-id":
+			continue
+		case "user-agent":
+			if len(values) > 0 {
+				cleaned.Set("User-Agent", ha.getRandomUserAgent(values[0]))
+			}
+			continue
+		}
+
+		for _, value := range values {
+			cleaned.Add(key, value)
+		}
+	}
+
+	cleaned.Set("Accept", "*/*")
+	cleaned.Set("Accept-Language", "en-US,en;q=0.9")
+	cleaned.Set("Accept-Encoding", "gzip, deflate, br")
+	cleaned.Set("DNT", "1")
+	cleaned.Set("Sec-Fetch-Mode", "navigate")
+
+	return cleaned
+}
 
 type Blocklist struct {
 	domains sync.Map
@@ -157,14 +244,15 @@ func (c *ResponseCache) Set(key string, resp *http.Response) {
 }
 
 type ProxyHandler struct {
-	Timeout   time.Duration
-	Username  *string
-	Password  *string
-	Cache     *ResponseCache
-	Pool      *ConnectionPool
-	Blocklist *Blocklist
-	Transport http.RoundTripper
-	sem       *semaphore.Weighted
+	Timeout          time.Duration
+	Username         *string
+	Password         *string
+	Cache            *ResponseCache
+	Pool             *ConnectionPool
+	Blocklist        *Blocklist
+	Transport        http.RoundTripper
+	headerAnonymizer *HeaderAnonymizer
+	sem              *semaphore.Weighted
 }
 
 func NewProxyHandler(timeoutSeconds int) *ProxyHandler {
@@ -194,12 +282,13 @@ func NewProxyHandler(timeoutSeconds int) *ProxyHandler {
 	http2.ConfigureTransport(transport)
 
 	return &ProxyHandler{
-		Timeout:   time.Duration(timeoutSeconds) * time.Second,
-		Cache:     NewResponseCache(10000, 5*time.Minute),
-		Pool:      NewConnectionPool(1000),
-		Blocklist: blocklist,
-		Transport: transport,
-		sem:       semaphore.NewWeighted(5000),
+		Timeout:          time.Duration(timeoutSeconds) * time.Second,
+		Cache:            NewResponseCache(10000, 5*time.Minute),
+		Pool:             NewConnectionPool(1000),
+		Blocklist:        blocklist,
+		Transport:        transport,
+		headerAnonymizer: NewHeaderAnonymizer(),
+		sem:              semaphore.NewWeighted(5000),
 	}
 }
 
@@ -284,7 +373,6 @@ func transferWithBuffer(dst io.WriteCloser, src io.ReadCloser) {
 	io.CopyBuffer(dst, src, buf)
 	bufferPool.Put(buf)
 }
-
 func (p *ProxyHandler) getConnection(ctx context.Context, addr string) (net.Conn, error) {
 	if conn, ok := p.Pool.Get(addr); ok {
 		return conn, nil
@@ -298,6 +386,8 @@ func (p *ProxyHandler) getConnection(ctx context.Context, addr string) (net.Conn
 }
 
 func (p *ProxyHandler) handleHTTP(w http.ResponseWriter, req *http.Request) {
+	req.Header = p.headerAnonymizer.anonymizeHeaders(req.Header)
+
 	if cachedResp := p.Cache.Get(req.URL.String()); cachedResp != nil {
 		copyHeader(w.Header(), cachedResp.Header)
 		w.WriteHeader(cachedResp.StatusCode)
@@ -305,12 +395,31 @@ func (p *ProxyHandler) handleHTTP(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	resp, err := p.Transport.RoundTrip(req)
+	outreq := req.Clone(req.Context())
+	if req.ContentLength == 0 {
+		outreq.Body = nil
+	}
+	if outreq.Body != nil {
+		defer outreq.Body.Close()
+	}
+
+	removeHopByHopHeaders(outreq.Header)
+
+	if clientIP, _, err := net.SplitHostPort(req.RemoteAddr); err == nil {
+		if prior, ok := outreq.Header["X-Forwarded-For"]; ok {
+			clientIP = strings.Join(prior, ", ") + ", " + clientIP
+		}
+		outreq.Header.Set("X-Forwarded-For", clientIP)
+	}
+
+	resp, err := p.Transport.RoundTrip(outreq)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 	defer resp.Body.Close()
+
+	removeHopByHopHeaders(resp.Header)
 
 	if isCacheable(req, resp) {
 		p.Cache.Set(req.URL.String(), resp)
@@ -319,6 +428,26 @@ func (p *ProxyHandler) handleHTTP(w http.ResponseWriter, req *http.Request) {
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
+}
+
+var hopHeaders = map[string]bool{
+	"Connection":          true,
+	"Proxy-Connection":    true,
+	"Keep-Alive":          true,
+	"Proxy-Authenticate":  true,
+	"Proxy-Authorization": true,
+	"Te":                  true,
+	"Trailer":             true,
+	"Transfer-Encoding":   true,
+	"Upgrade":             true,
+}
+
+func removeHopByHopHeaders(header http.Header) {
+	for h := range header {
+		if hopHeaders[h] {
+			header.Del(h)
+		}
+	}
 }
 
 func proxyBasicAuth(req *http.Request) (username, password string, ok bool) {
@@ -351,6 +480,56 @@ func copyHeader(dst, src http.Header) {
 }
 
 func isCacheable(req *http.Request, resp *http.Response) bool {
+	if len(req.Header.Get("Authorization")) > 0 {
+		return false
+	}
+
+	if req.Method != http.MethodGet {
+		return false
+	}
+
+	respCC := parseCacheControl(resp.Header.Get("Cache-Control"))
+	if respCC.noStore || respCC.noCache || respCC.private {
+		return false
+	}
+
+	if respCC.public {
+		return true
+	}
+
 	_, _, err := cachecontrol.CachableResponse(req, resp, cachecontrol.Options{})
 	return err == nil
+}
+
+type cacheControl struct {
+	noCache bool
+	noStore bool
+	public  bool
+	private bool
+	maxAge  int
+}
+
+func parseCacheControl(header string) cacheControl {
+	cc := cacheControl{}
+	parts := strings.Split(header, ",")
+
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "no-cache" {
+			cc.noCache = true
+		} else if part == "no-store" {
+			cc.noStore = true
+		} else if part == "public" {
+			cc.public = true
+		} else if part == "private" {
+			cc.private = true
+		} else if strings.HasPrefix(part, "max-age=") {
+			maxAge := strings.TrimPrefix(part, "max-age=")
+			if age, err := time.ParseDuration(maxAge + "s"); err == nil {
+				cc.maxAge = int(age.Seconds())
+			}
+		}
+	}
+
+	return cc
 }
