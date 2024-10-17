@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"github.com/miekg/dns"
@@ -11,20 +12,19 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/glog"
 	"github.com/pquerna/cachecontrol"
 	"golang.org/x/net/http2"
 )
 
 type TunnelCache struct {
-	connections map[string]*net.Conn
+	connections map[string]net.Conn
 	mu          sync.RWMutex
 	expiry      map[string]time.Time
 }
 
 func NewTunnelCache() *TunnelCache {
 	cache := &TunnelCache{
-		connections: make(map[string]*net.Conn),
+		connections: make(map[string]net.Conn),
 		expiry:      make(map[string]time.Time),
 	}
 	go cache.cleanupRoutine()
@@ -38,6 +38,31 @@ func (c *TunnelCache) cleanupRoutine() {
 	}
 }
 
+func (c *TunnelCache) Set(key string, conn net.Conn) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	//log.Printf("TunnelCache: Storing connection for key ****\n")
+
+	c.connections[key] = conn
+	c.expiry[key] = time.Now().Add(5 * time.Minute)
+}
+
+func (c *TunnelCache) Get(key string) (net.Conn, bool) {
+	//start := time.Now()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	conn, exists := c.connections[key]
+	if exists {
+		c.expiry[key] = time.Now().Add(5 * time.Minute)
+		//log.Printf("TunnelCache: Hit for key **** (took %dms)\n", time.Since(start).Milliseconds())
+		return conn, true
+	}
+
+	//log.Printf("TunnelCache: Miss for key **** (took %dms)\n", time.Since(start).Milliseconds())
+	return nil, false
+}
+
 func (c *TunnelCache) cleanup() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -46,32 +71,13 @@ func (c *TunnelCache) cleanup() {
 	for key, exp := range c.expiry {
 		if now.After(exp) {
 			if conn, exists := c.connections[key]; exists {
-				(*conn).Close()
+				conn.Close()
 				delete(c.connections, key)
 				delete(c.expiry, key)
+				//log.Printf("TunnelCache: Expired and removed connection for key ***\n")
 			}
 		}
 	}
-}
-
-func (c *TunnelCache) Set(key string, conn *net.Conn) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	c.connections[key] = conn
-	c.expiry[key] = time.Now().Add(5 * time.Minute)
-}
-
-func (c *TunnelCache) Get(key string) (*net.Conn, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	conn, exists := c.connections[key]
-	if exists {
-		c.expiry[key] = time.Now().Add(5 * time.Minute)
-		return conn, true
-	}
-	return nil, false
 }
 
 type Cache struct {
@@ -86,14 +92,23 @@ func NewCache() *Cache {
 }
 
 func (c *Cache) Get(req *http.Request) *http.Response {
+	//	start := time.Now()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.items[req.URL.String()]
+
+	resp := c.items[req.URL.String()]
+	if resp != nil {
+		//log.Printf("Cache: Hit for URL *** (took %dms)\n", time.Since(start).Milliseconds())
+	} else {
+		//log.Printf("Cache: Miss for URL *** (took %dms)\n", time.Since(start).Milliseconds())
+	}
+	return resp
 }
 
 func (c *Cache) Set(req *http.Request, resp *http.Response) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	//log.Printf("Cache: Storing response for URL ***\n")
 	c.items[req.URL.String()] = resp
 }
 
@@ -109,14 +124,23 @@ func NewDNSCache() *DNSCache {
 }
 
 func (c *DNSCache) Get(domain string) string {
+	//start := time.Now()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.items[domain]
+
+	ip := c.items[domain]
+	if ip != "" {
+		//log.Printf("DNSCache: Hit for domain *** (took %dms)\n", time.Since(start).Milliseconds())
+	} else {
+		////log.Printf("DNSCache: Miss for domain *** (took %dms)\n", time.Since(start).Milliseconds())
+	}
+	return ip
 }
 
 func (c *DNSCache) Set(domain, ip string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	////log.Printf("DNSCache: Storing IP **** for domain ***** \n", ip, domain)
 	c.items[domain] = ip
 }
 
@@ -124,8 +148,6 @@ type ProxyHandler struct {
 	Timeout     time.Duration
 	Username    *string
 	Password    *string
-	LogAuth     bool
-	LogHeaders  bool
 	Cache       *Cache
 	DNSCache    *DNSCache
 	TunnelCache *TunnelCache
@@ -141,27 +163,20 @@ func NewProxyHandler(timeoutSeconds int) *ProxyHandler {
 }
 
 func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	/*	glog.V(1).Infof("Serving '%s' request from '%s' to '%s'\n", r.Method, r.RemoteAddr, r.Host)
-		if p.LogHeaders {
-			for name, values := range r.Header {
-				for i, value := range values {
-					glog.V(1).Infof("'%s': [%d] %s", name, i, value)
-				}
-			}
-		}*/
+	if !isValidHostname(r.Host) {
+		http.Error(w, "Invalid hostname", http.StatusBadRequest)
+		return
+	}
+
 	if p.Username != nil && p.Password != nil {
 		username, password, ok := proxyBasicAuth(r)
 		if !ok || username != *p.Username || password != *p.Password {
-			if p.LogAuth {
-				//glog.Errorf("Unauthorized, username: %s, password: %s\n", username, password)
-			} else {
-				//	glog.Errorln("Unauthorized")
-			}
 			w.Header().Set("Proxy-Authenticate", "Basic")
 			http.Error(w, "Unauthorized", http.StatusProxyAuthRequired)
 			return
 		}
 	}
+
 	if r.Method == http.MethodConnect {
 		p.handleTunneling(w, r)
 	} else {
@@ -177,40 +192,41 @@ func (p *ProxyHandler) handleTunneling(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cacheKey := fmt.Sprintf("%s:%s", host, port)
+	//start := time.Now()
 
 	if cachedConn, exists := p.TunnelCache.Get(cacheKey); exists {
-		if err := p.reuseConnection(w, r, cachedConn); err == nil {
+		if err := p.reuseConnection(w, r, &cachedConn); err == nil {
+			//log.Printf("TunnelCache: Reused cached connection for key %s (took %dms)\n", cacheKey, time.Since(start).Milliseconds())
 			return
 		}
 	}
 
 	ip, err := p.resolveDomainDoH(host)
 	if err != nil {
-		glog.Errorf("Failed to resolve domain using DoH")
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 
-	dest_conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, port), p.Timeout)
+	dest_conn, err := tls.DialWithDialer(&net.Dialer{Timeout: p.Timeout}, "tcp", net.JoinHostPort(ip, port), &tls.Config{
+		InsecureSkipVerify: false,
+	})
 	if err != nil {
-		glog.Errorf("Failed to dial host")
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 
-	p.TunnelCache.Set(cacheKey, &dest_conn)
+	p.TunnelCache.Set(cacheKey, dest_conn)
+	//log.Printf("TunnelCache: New connection created for key %s (took %dms)\n", cacheKey, time.Since(start).Milliseconds())
 
 	w.WriteHeader(http.StatusOK)
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
-		glog.Errorln("Attempted to hijack connection that does not support it")
 		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
 		return
 	}
 
 	client_conn, _, err := hijacker.Hijack()
 	if err != nil {
-		glog.Errorf("Failed to hijack connection")
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
@@ -220,7 +236,6 @@ func (p *ProxyHandler) handleTunneling(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *ProxyHandler) reuseConnection(w http.ResponseWriter, r *http.Request, cachedConn *net.Conn) error {
-	fmt.Printf("Using cached connection\n")
 	(*cachedConn).SetReadDeadline(time.Now())
 	_, err := (*cachedConn).Read(make([]byte, 0))
 	(*cachedConn).SetReadDeadline(time.Time{})
@@ -242,24 +257,19 @@ func (p *ProxyHandler) reuseConnection(w http.ResponseWriter, r *http.Request, c
 
 	go p.transfer(*cachedConn, client_conn)
 	go p.transfer(client_conn, *cachedConn)
-
 	return nil
 }
 
 func (p *ProxyHandler) handleHTTP(w http.ResponseWriter, req *http.Request) {
-
 	if cachedResp := p.Cache.Get(req); cachedResp != nil {
-		fmt.Printf("[Cache] Hit for %s\n", req.URL.String())
 		copyHeader(w.Header(), cachedResp.Header)
 		w.WriteHeader(cachedResp.StatusCode)
 		io.Copy(w, cachedResp.Body)
 		return
 	}
-	fmt.Printf("[Cache] Miss for %s\n", req.URL.String())
 
 	ip, err := p.resolveDomainDoH(req.Host)
 	if err != nil {
-		glog.Errorf("Failed to resolve domain using DoH")
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
@@ -271,6 +281,9 @@ func (p *ProxyHandler) handleHTTP(w http.ResponseWriter, req *http.Request) {
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: false,
+		},
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
@@ -281,7 +294,6 @@ func (p *ProxyHandler) handleHTTP(w http.ResponseWriter, req *http.Request) {
 
 	resp, err := transport.RoundTrip(req)
 	if err != nil {
-		glog.Errorf("Failed to proxy request")
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
@@ -289,9 +301,6 @@ func (p *ProxyHandler) handleHTTP(w http.ResponseWriter, req *http.Request) {
 
 	if isCacheable(req, resp) {
 		p.Cache.Set(req, resp)
-		fmt.Printf("[Cache] Stored response for %s\n", req.URL.String())
-	} else {
-		fmt.Printf("[Cache] Response for %s is not cacheable\n", req.URL.String())
 	}
 
 	copyHeader(w.Header(), resp.Header)
@@ -354,13 +363,12 @@ func (p *ProxyHandler) resolveDomainDoH(domain string) (string, error) {
 
 	for _, ans := range r.Answer {
 		if a, ok := ans.(*dns.A); ok {
-			ip := a.A.String()
-			p.DNSCache.Set(domain, ip)
-			return ip, nil
+			p.DNSCache.Set(domain, a.A.String())
+			return a.A.String(), nil
 		}
 	}
 
-	return "", fmt.Errorf("no A record found for domain: %s", domain)
+	return "", fmt.Errorf("no A record found for domain")
 }
 
 func (p *ProxyHandler) transfer(destination io.WriteCloser, source io.ReadCloser) {
@@ -369,30 +377,13 @@ func (p *ProxyHandler) transfer(destination io.WriteCloser, source io.ReadCloser
 	io.Copy(destination, source)
 }
 
-func isCacheable(req *http.Request, resp *http.Response) bool {
-	reasons, expires, _ := cachecontrol.CachableResponse(req, resp, cachecontrol.Options{})
-	return len(reasons) == 0 && !expires.IsZero()
-}
-
-func copyHeader(dst, src http.Header) {
-	for k, vv := range src {
-		for _, v := range vv {
-			dst.Add(k, v)
-		}
-	}
-}
-
-func proxyBasicAuth(r *http.Request) (username, password string, ok bool) {
-	auth := r.Header.Get("Proxy-Authorization")
+func proxyBasicAuth(req *http.Request) (username, password string, ok bool) {
+	auth := req.Header.Get("Proxy-Authorization")
 	if auth == "" {
 		return
 	}
-	return parseBasicAuth(auth)
-}
-
-func parseBasicAuth(auth string) (username, password string, ok bool) {
 	const prefix = "Basic "
-	if len(auth) < len(prefix) || !equalFold(auth[:len(prefix)], prefix) {
+	if !strings.HasPrefix(auth, prefix) {
 		return
 	}
 	c, err := base64.StdEncoding.DecodeString(auth[len(prefix):])
@@ -407,21 +398,22 @@ func parseBasicAuth(auth string) (username, password string, ok bool) {
 	return cs[:s], cs[s+1:], true
 }
 
-func equalFold(s, t string) bool {
-	if len(s) != len(t) {
-		return false
-	}
-	for i := 0; i < len(s); i++ {
-		if lower(s[i]) != lower(t[i]) {
-			return false
+func copyHeader(dst, src http.Header) {
+	for k, vv := range src {
+		for _, v := range vv {
+			dst.Add(k, v)
 		}
 	}
-	return true
 }
 
-func lower(b byte) byte {
-	if 'A' <= b && b <= 'Z' {
-		return b + ('a' - 'A')
+func isCacheable(req *http.Request, resp *http.Response) bool {
+	_, _, err := cachecontrol.CachableResponse(req, resp, cachecontrol.Options{})
+	return err == nil
+}
+
+func isValidHostname(hostname string) bool {
+	if len(hostname) == 0 || len(hostname) > 255 {
+		return false
 	}
-	return b
+	return true
 }

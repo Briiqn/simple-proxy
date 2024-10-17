@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strings"
 
 	"github.com/golang/glog"
 	"github.com/jthomperoo/simple-proxy/proxy"
@@ -63,17 +62,6 @@ func main() {
 	}
 
 	handler := proxy.NewProxyHandler(timeoutSecs)
-	handler.LogAuth = logAuth
-	handler.LogHeaders = logHeaders
-
-	if basicAuth != "" {
-		parts := strings.Split(basicAuth, ":")
-		if len(parts) < 2 {
-			glog.Fatalf("Invalid basic auth provided, must be in format 'username:password', auth: %s\n", basicAuth)
-		}
-		handler.Username = &parts[0]
-		handler.Password = &parts[1]
-	}
 
 	server := &http.Server{
 		Addr:         fmt.Sprintf("%s:%s", bind, port),
