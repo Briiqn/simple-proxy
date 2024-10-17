@@ -12,20 +12,18 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hashicorp/golang-lru/v2"
 	"github.com/pquerna/cachecontrol"
 	"golang.org/x/net/http2"
 	"golang.org/x/sync/semaphore"
 )
 
 type Blocklist struct {
-	domains map[string]struct{}
-	mu      sync.RWMutex
+	domains sync.Map
 }
 
 func NewBlocklist() *Blocklist {
-	return &Blocklist{
-		domains: make(map[string]struct{}),
-	}
+	return &Blocklist{}
 }
 
 func (b *Blocklist) LoadFromURL(ctx context.Context) error {
@@ -41,7 +39,6 @@ func (b *Blocklist) LoadFromURL(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
-	newDomains := make(map[string]struct{})
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
@@ -51,19 +48,11 @@ func (b *Blocklist) LoadFromURL(ctx context.Context) error {
 
 		parts := strings.Fields(line)
 		if len(parts) >= 2 {
-			newDomains[parts[1]] = struct{}{}
+			b.domains.Store(strings.ToLower(parts[1]), struct{}{})
 		}
 	}
 
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("error reading blocklist: %v", err)
-	}
-
-	b.mu.Lock()
-	b.domains = newDomains
-	b.mu.Unlock()
-
-	return nil
+	return scanner.Err()
 }
 
 func (b *Blocklist) IsDomainBlocked(domain string) bool {
@@ -71,36 +60,53 @@ func (b *Blocklist) IsDomainBlocked(domain string) bool {
 		domain = host
 	}
 
-	b.mu.RLock()
-	_, blocked := b.domains[domain]
-	b.mu.RUnlock()
-	return blocked
+	domain = strings.ToLower(domain)
+
+	if _, blocked := b.domains.Load(domain); blocked {
+		return true
+	}
+
+	parts := strings.Split(domain, ".")
+	for i := 0; i < len(parts)-1; i++ {
+		parentDomain := strings.Join(parts[i+1:], ".")
+		if _, blocked := b.domains.Load(parentDomain); blocked {
+			return true
+		}
+	}
+
+	return false
 }
 
 type ConnectionPool struct {
-	pool    map[string]chan net.Conn
-	mu      sync.RWMutex
-	maxIdle int
+	pools sync.Map
+	size  int32
 }
 
 func NewConnectionPool(maxIdleConns int) *ConnectionPool {
 	return &ConnectionPool{
-		pool:    make(map[string]chan net.Conn),
-		maxIdle: maxIdleConns,
+		size: int32(maxIdleConns),
 	}
 }
 
-func (p *ConnectionPool) Get(key string) (net.Conn, bool) {
-	p.mu.RLock()
-	ch, exists := p.pool[key]
-	p.mu.RUnlock()
+type connChan struct {
+	ch     chan net.Conn
+	expiry time.Time
+}
 
-	if !exists {
+func (p *ConnectionPool) Get(key string) (net.Conn, bool) {
+	value, ok := p.pools.Load(key)
+	if !ok {
+		return nil, false
+	}
+
+	pool := value.(*connChan)
+	if time.Now().After(pool.expiry) {
+		p.pools.Delete(key)
 		return nil, false
 	}
 
 	select {
-	case conn := <-ch:
+	case conn := <-pool.ch:
 		return conn, true
 	default:
 		return nil, false
@@ -108,25 +114,21 @@ func (p *ConnectionPool) Get(key string) (net.Conn, bool) {
 }
 
 func (p *ConnectionPool) Put(key string, conn net.Conn) {
-	p.mu.Lock()
-	if _, exists := p.pool[key]; !exists {
-		p.pool[key] = make(chan net.Conn, p.maxIdle)
-	}
-	p.mu.Unlock()
+	value, _ := p.pools.LoadOrStore(key, &connChan{
+		ch:     make(chan net.Conn, p.size),
+		expiry: time.Now().Add(90 * time.Second),
+	})
 
+	pool := value.(*connChan)
 	select {
-	case p.pool[key] <- conn:
+	case pool.ch <- conn:
 	default:
 		conn.Close()
 	}
 }
 
 type ResponseCache struct {
-	cache   map[string]*cacheEntry
-	mu      sync.RWMutex
-	maxAge  time.Duration
-	maxSize int
-	sem     *semaphore.Weighted
+	cache *lru.Cache[string, *cacheEntry]
 }
 
 type cacheEntry struct {
@@ -135,65 +137,23 @@ type cacheEntry struct {
 }
 
 func NewResponseCache(maxSize int, maxAge time.Duration) *ResponseCache {
-	cache := &ResponseCache{
-		cache:   make(map[string]*cacheEntry),
-		maxAge:  maxAge,
-		maxSize: maxSize,
-		sem:     semaphore.NewWeighted(int64(maxSize)),
-	}
-	go cache.periodicCleanup(context.Background())
-	return cache
-}
-
-func (c *ResponseCache) periodicCleanup(ctx context.Context) {
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			c.cleanup()
-		}
-	}
-}
-
-func (c *ResponseCache) cleanup() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	now := time.Now()
-	for key, entry := range c.cache {
-		if now.After(entry.expires) {
-			delete(c.cache, key)
-			c.sem.Release(1)
-		}
-	}
+	cache, _ := lru.New[string, *cacheEntry](maxSize)
+	return &ResponseCache{cache: cache}
 }
 
 func (c *ResponseCache) Get(key string) *http.Response {
-	c.mu.RLock()
-	entry, exists := c.cache[key]
-	c.mu.RUnlock()
-
-	if !exists || time.Now().After(entry.expires) {
+	entry, ok := c.cache.Get(key)
+	if !ok || time.Now().After(entry.expires) {
 		return nil
 	}
 	return entry.response
 }
 
 func (c *ResponseCache) Set(key string, resp *http.Response) {
-	if !c.sem.TryAcquire(1) {
-		return
-	}
-
-	c.mu.Lock()
-	c.cache[key] = &cacheEntry{
+	c.cache.Add(key, &cacheEntry{
 		response: resp,
-		expires:  time.Now().Add(c.maxAge),
-	}
-	c.mu.Unlock()
+		expires:  time.Now().Add(5 * time.Minute),
+	})
 }
 
 type ProxyHandler struct {
@@ -203,7 +163,7 @@ type ProxyHandler struct {
 	Cache     *ResponseCache
 	Pool      *ConnectionPool
 	Blocklist *Blocklist
-	Transport *http.Transport
+	Transport http.RoundTripper
 	sem       *semaphore.Weighted
 }
 
@@ -222,20 +182,24 @@ func NewProxyHandler(timeoutSeconds int) *ProxyHandler {
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
 		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
+		MaxIdleConns:          1000,
+		MaxIdleConnsPerHost:   100,
+		MaxConnsPerHost:       200,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		WriteBufferSize:       64 * 1024,
+		ReadBufferSize:        64 * 1024,
 	}
 	http2.ConfigureTransport(transport)
 
 	return &ProxyHandler{
 		Timeout:   time.Duration(timeoutSeconds) * time.Second,
-		Cache:     NewResponseCache(1000, 5*time.Minute),
-		Pool:      NewConnectionPool(100),
+		Cache:     NewResponseCache(10000, 5*time.Minute),
+		Pool:      NewConnectionPool(1000),
 		Blocklist: blocklist,
 		Transport: transport,
-		sem:       semaphore.NewWeighted(1000),
+		sem:       semaphore.NewWeighted(5000),
 	}
 }
 
@@ -302,8 +266,23 @@ func (p *ProxyHandler) handleTunneling(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	go p.transfer(conn, client_conn)
-	go p.transfer(client_conn, conn)
+	go transferWithBuffer(conn, client_conn)
+	go transferWithBuffer(client_conn, conn)
+}
+
+var bufferPool = sync.Pool{
+	New: func() interface{} {
+		return make([]byte, 32*1024)
+	},
+}
+
+func transferWithBuffer(dst io.WriteCloser, src io.ReadCloser) {
+	defer dst.Close()
+	defer src.Close()
+
+	buf := bufferPool.Get().([]byte)
+	io.CopyBuffer(dst, src, buf)
+	bufferPool.Put(buf)
 }
 
 func (p *ProxyHandler) getConnection(ctx context.Context, addr string) (net.Conn, error) {
@@ -311,7 +290,10 @@ func (p *ProxyHandler) getConnection(ctx context.Context, addr string) (net.Conn
 		return conn, nil
 	}
 
-	dialer := &net.Dialer{Timeout: p.Timeout}
+	dialer := &net.Dialer{
+		Timeout:   p.Timeout,
+		KeepAlive: 30 * time.Second,
+	}
 	return dialer.DialContext(ctx, "tcp", addr)
 }
 
@@ -337,12 +319,6 @@ func (p *ProxyHandler) handleHTTP(w http.ResponseWriter, req *http.Request) {
 	copyHeader(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
-}
-
-func (p *ProxyHandler) transfer(dst io.WriteCloser, src io.ReadCloser) {
-	defer dst.Close()
-	defer src.Close()
-	io.Copy(dst, src)
 }
 
 func proxyBasicAuth(req *http.Request) (username, password string, ok bool) {
