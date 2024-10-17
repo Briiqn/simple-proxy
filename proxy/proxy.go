@@ -188,6 +188,9 @@ func NewProxyHandler(timeoutSeconds int) *ProxyHandler {
 	err := blocklist.LoadFromURL("https://raw.githubusercontent.com/badmojr/1Hosts/refs/heads/master/Xtra/hosts.txt")
 	if err != nil {
 		fmt.Printf("Warning: Failed to load blocklist: %v\n", err)
+	} else {
+		fmt.Printf("Loaded Blocklist Sucessfully")
+
 	}
 
 	return &ProxyHandler{
