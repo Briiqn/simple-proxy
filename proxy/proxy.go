@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"github.com/miekg/dns"
@@ -17,14 +16,14 @@ import (
 )
 
 type TunnelCache struct {
-	connections map[string]net.Conn
+	connections map[string]*net.Conn
 	mu          sync.RWMutex
 	expiry      map[string]time.Time
 }
 
 func NewTunnelCache() *TunnelCache {
 	cache := &TunnelCache{
-		connections: make(map[string]net.Conn),
+		connections: make(map[string]*net.Conn),
 		expiry:      make(map[string]time.Time),
 	}
 	go cache.cleanupRoutine()
@@ -38,7 +37,23 @@ func (c *TunnelCache) cleanupRoutine() {
 	}
 }
 
-func (c *TunnelCache) Set(key string, conn net.Conn) {
+func (c *TunnelCache) cleanup() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+	for key, exp := range c.expiry {
+		if now.After(exp) {
+			if conn, exists := c.connections[key]; exists {
+				(*conn).Close()
+				delete(c.connections, key)
+				delete(c.expiry, key)
+			}
+		}
+	}
+}
+
+func (c *TunnelCache) Set(key string, conn *net.Conn) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -46,7 +61,7 @@ func (c *TunnelCache) Set(key string, conn net.Conn) {
 	c.expiry[key] = time.Now().Add(5 * time.Minute)
 }
 
-func (c *TunnelCache) Get(key string) (net.Conn, bool) {
+func (c *TunnelCache) Get(key string) (*net.Conn, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -56,21 +71,6 @@ func (c *TunnelCache) Get(key string) (net.Conn, bool) {
 		return conn, true
 	}
 	return nil, false
-}
-func (c *TunnelCache) cleanup() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	now := time.Now()
-	for key, exp := range c.expiry {
-		if now.After(exp) {
-			if conn, exists := c.connections[key]; exists {
-				conn.Close()
-				delete(c.connections, key)
-				delete(c.expiry, key)
-			}
-		}
-	}
 }
 
 type Cache struct {
@@ -138,11 +138,6 @@ func NewProxyHandler(timeoutSeconds int) *ProxyHandler {
 }
 
 func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if !isValidHostname(r.Host) {
-		http.Error(w, "Invalid hostname", http.StatusBadRequest)
-		return
-	}
-
 	if p.Username != nil && p.Password != nil {
 		username, password, ok := proxyBasicAuth(r)
 		if !ok || username != *p.Username || password != *p.Password {
@@ -151,7 +146,6 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-
 	if r.Method == http.MethodConnect {
 		p.handleTunneling(w, r)
 	} else {
@@ -169,8 +163,7 @@ func (p *ProxyHandler) handleTunneling(w http.ResponseWriter, r *http.Request) {
 	cacheKey := fmt.Sprintf("%s:%s", host, port)
 
 	if cachedConn, exists := p.TunnelCache.Get(cacheKey); exists {
-
-		if err := p.reuseConnection(w, r, &cachedConn); err == nil {
+		if err := p.reuseConnection(w, r, cachedConn); err == nil {
 			return
 		}
 	}
@@ -181,15 +174,13 @@ func (p *ProxyHandler) handleTunneling(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dest_conn, err := tls.DialWithDialer(&net.Dialer{Timeout: p.Timeout}, "tcp", net.JoinHostPort(ip, port), &tls.Config{
-		InsecureSkipVerify: false,
-	})
+	dest_conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, port), p.Timeout)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 
-	p.TunnelCache.Set(cacheKey, dest_conn)
+	p.TunnelCache.Set(cacheKey, &dest_conn)
 
 	w.WriteHeader(http.StatusOK)
 	hijacker, ok := w.(http.Hijacker)
@@ -204,6 +195,7 @@ func (p *ProxyHandler) handleTunneling(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Launch data transfer in parallel using goroutines
 	go p.transfer(dest_conn, client_conn)
 	go p.transfer(client_conn, dest_conn)
 }
@@ -228,8 +220,10 @@ func (p *ProxyHandler) reuseConnection(w http.ResponseWriter, r *http.Request, c
 		return fmt.Errorf("failed to hijack connection: %v", err)
 	}
 
+	// Launch data transfer in parallel using goroutines
 	go p.transfer(*cachedConn, client_conn)
 	go p.transfer(client_conn, *cachedConn)
+
 	return nil
 }
 
@@ -254,9 +248,6 @@ func (p *ProxyHandler) handleHTTP(w http.ResponseWriter, req *http.Request) {
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}).DialContext,
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: false,
-		},
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
@@ -382,11 +373,4 @@ func copyHeader(dst, src http.Header) {
 func isCacheable(req *http.Request, resp *http.Response) bool {
 	_, _, err := cachecontrol.CachableResponse(req, resp, cachecontrol.Options{})
 	return err == nil
-}
-
-func isValidHostname(hostname string) bool {
-	if len(hostname) == 0 || len(hostname) > 255 {
-		return false
-	}
-	return true
 }
