@@ -62,7 +62,10 @@ func main() {
 	}
 
 	handler := proxy.NewProxyHandler(timeoutSecs)
-
+	err := http.ListenAndServe("8080", handler)
+	if err == nil {
+		return
+	}
 	server := &http.Server{
 		Addr:         fmt.Sprintf("%s:%s", bind, port),
 		Handler:      handler,

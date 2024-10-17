@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bufio"
 	"encoding/base64"
 	"fmt"
 	"github.com/miekg/dns"
@@ -14,6 +15,58 @@ import (
 	"github.com/pquerna/cachecontrol"
 	"golang.org/x/net/http2"
 )
+
+type Blocklist struct {
+	domains map[string]struct{}
+	mu      sync.RWMutex
+}
+
+func NewBlocklist() *Blocklist {
+	return &Blocklist{
+		domains: make(map[string]struct{}),
+	}
+}
+
+func (b *Blocklist) LoadFromURL(url string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("failed to download blocklist: %v", err)
+	}
+	defer resp.Body.Close()
+
+	scanner := bufio.NewScanner(resp.Body)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	b.domains = make(map[string]struct{})
+
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "#") || line == "" {
+			continue
+		}
+
+		parts := strings.Fields(line)
+		if len(parts) >= 2 {
+			domain := parts[1]
+			b.domains[domain] = struct{}{}
+		}
+	}
+
+	return scanner.Err()
+}
+
+func (b *Blocklist) IsDomainBlocked(domain string) bool {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+
+	if host, _, err := net.SplitHostPort(domain); err == nil {
+		domain = host
+	}
+
+	_, blocked := b.domains[domain]
+	return blocked
+}
 
 type TunnelCache struct {
 	connections map[string]*net.Conn
@@ -126,14 +179,23 @@ type ProxyHandler struct {
 	Cache       *Cache
 	DNSCache    *DNSCache
 	TunnelCache *TunnelCache
+	Blocklist   *Blocklist
 }
 
 func NewProxyHandler(timeoutSeconds int) *ProxyHandler {
+	blocklist := NewBlocklist()
+	// Download and load the blocklist
+	err := blocklist.LoadFromURL("https://raw.githubusercontent.com/badmojr/1Hosts/refs/heads/master/Xtra/hosts.txt")
+	if err != nil {
+		fmt.Printf("Warning: Failed to load blocklist: %v\n", err)
+	}
+
 	return &ProxyHandler{
 		Timeout:     time.Duration(timeoutSeconds) * time.Second,
 		Cache:       NewCache(),
 		DNSCache:    NewDNSCache(),
 		TunnelCache: NewTunnelCache(),
+		Blocklist:   blocklist,
 	}
 }
 
@@ -146,6 +208,18 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	// Check if domain is blocked
+	host := r.Host
+	if host == "" {
+		host = r.URL.Host
+	}
+
+	if p.Blocklist.IsDomainBlocked(host) {
+		http.Error(w, "Access to this domain is blocked", http.StatusForbidden)
+		return
+	}
+
 	if r.Method == http.MethodConnect {
 		p.handleTunneling(w, r)
 	} else {
@@ -195,7 +269,6 @@ func (p *ProxyHandler) handleTunneling(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Launch data transfer in parallel using goroutines
 	go p.transfer(dest_conn, client_conn)
 	go p.transfer(client_conn, dest_conn)
 }
@@ -220,7 +293,6 @@ func (p *ProxyHandler) reuseConnection(w http.ResponseWriter, r *http.Request, c
 		return fmt.Errorf("failed to hijack connection: %v", err)
 	}
 
-	// Launch data transfer in parallel using goroutines
 	go p.transfer(*cachedConn, client_conn)
 	go p.transfer(client_conn, *cachedConn)
 
@@ -302,7 +374,7 @@ func (p *ProxyHandler) resolveDomainDoH(domain string) (string, error) {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to make DoH request")
+		return "", fmt.Errorf("failed to make DoH request %s", err.Error())
 	}
 
 	defer resp.Body.Close()
