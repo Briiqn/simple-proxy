@@ -41,28 +41,22 @@ func (c *TunnelCache) cleanupRoutine() {
 func (c *TunnelCache) Set(key string, conn net.Conn) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	//log.Printf("TunnelCache: Storing connection for key ****\n")
 
 	c.connections[key] = conn
 	c.expiry[key] = time.Now().Add(5 * time.Minute)
 }
 
 func (c *TunnelCache) Get(key string) (net.Conn, bool) {
-	//start := time.Now()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	conn, exists := c.connections[key]
 	if exists {
 		c.expiry[key] = time.Now().Add(5 * time.Minute)
-		//log.Printf("TunnelCache: Hit for key **** (took %dms)\n", time.Since(start).Milliseconds())
 		return conn, true
 	}
-
-	//log.Printf("TunnelCache: Miss for key **** (took %dms)\n", time.Since(start).Milliseconds())
 	return nil, false
 }
-
 func (c *TunnelCache) cleanup() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -74,7 +68,6 @@ func (c *TunnelCache) cleanup() {
 				conn.Close()
 				delete(c.connections, key)
 				delete(c.expiry, key)
-				//log.Printf("TunnelCache: Expired and removed connection for key ***\n")
 			}
 		}
 	}
@@ -92,23 +85,14 @@ func NewCache() *Cache {
 }
 
 func (c *Cache) Get(req *http.Request) *http.Response {
-	//	start := time.Now()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-
-	resp := c.items[req.URL.String()]
-	if resp != nil {
-		//log.Printf("Cache: Hit for URL *** (took %dms)\n", time.Since(start).Milliseconds())
-	} else {
-		//log.Printf("Cache: Miss for URL *** (took %dms)\n", time.Since(start).Milliseconds())
-	}
-	return resp
+	return c.items[req.URL.String()]
 }
 
 func (c *Cache) Set(req *http.Request, resp *http.Response) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	//log.Printf("Cache: Storing response for URL ***\n")
 	c.items[req.URL.String()] = resp
 }
 
@@ -124,23 +108,14 @@ func NewDNSCache() *DNSCache {
 }
 
 func (c *DNSCache) Get(domain string) string {
-	//start := time.Now()
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-
-	ip := c.items[domain]
-	if ip != "" {
-		//log.Printf("DNSCache: Hit for domain *** (took %dms)\n", time.Since(start).Milliseconds())
-	} else {
-		////log.Printf("DNSCache: Miss for domain *** (took %dms)\n", time.Since(start).Milliseconds())
-	}
-	return ip
+	return c.items[domain]
 }
 
 func (c *DNSCache) Set(domain, ip string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	////log.Printf("DNSCache: Storing IP **** for domain ***** \n", ip, domain)
 	c.items[domain] = ip
 }
 
@@ -192,11 +167,10 @@ func (p *ProxyHandler) handleTunneling(w http.ResponseWriter, r *http.Request) {
 	}
 
 	cacheKey := fmt.Sprintf("%s:%s", host, port)
-	//start := time.Now()
 
 	if cachedConn, exists := p.TunnelCache.Get(cacheKey); exists {
+
 		if err := p.reuseConnection(w, r, &cachedConn); err == nil {
-			//log.Printf("TunnelCache: Reused cached connection for key %s (took %dms)\n", cacheKey, time.Since(start).Milliseconds())
 			return
 		}
 	}
@@ -216,7 +190,6 @@ func (p *ProxyHandler) handleTunneling(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p.TunnelCache.Set(cacheKey, dest_conn)
-	//log.Printf("TunnelCache: New connection created for key %s (took %dms)\n", cacheKey, time.Since(start).Milliseconds())
 
 	w.WriteHeader(http.StatusOK)
 	hijacker, ok := w.(http.Hijacker)
