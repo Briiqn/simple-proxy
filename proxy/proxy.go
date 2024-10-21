@@ -272,6 +272,9 @@ func NewProxyServer(httpAddr, socksAddr string, timeoutSeconds int, username, pa
 
 	socksConfig := &socks5.Config{
 		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if httpHandler.Blocklist.IsDomainBlocked(addr) {
+				return nil, fmt.Errorf("blocked domain: %s", addr)
+			}
 			return httpHandler.getConnection(ctx, addr)
 		},
 	}
@@ -296,15 +299,12 @@ func NewProxyServer(httpAddr, socksAddr string, timeoutSeconds int, username, pa
 		Password:    password,
 	}, nil
 }
-
 func NewProxyHandler(timeoutSeconds int) *ProxyHandler {
 	blocklist := NewBlocklist()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 
-	if err := blocklist.LoadFromURL(ctx); err != nil {
-		fmt.Printf("Warning: Failed to load blocklist: %v\n", err)
-	}
+	blocklist.LoadFromURL(ctx)
 
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{
@@ -333,16 +333,15 @@ func NewProxyHandler(timeoutSeconds int) *ProxyHandler {
 		sem:              semaphore.NewWeighted(5000),
 	}
 }
+
 func (ps *ProxyServer) Start() error {
 	errChan := make(chan error, 2)
 
 	go func() {
-		fmt.Printf("Starting HTTP proxy on %s\n", ps.HTTPAddr)
 		errChan <- http.ListenAndServe(ps.HTTPAddr, ps.HTTPHandler)
 	}()
 
 	go func() {
-		fmt.Printf("Starting SOCKS5 proxy on %s\n", ps.SOCKSAddr)
 		listener, err := net.Listen("tcp", ps.SOCKSAddr)
 		if err != nil {
 			errChan <- fmt.Errorf("failed to start SOCKS5 listener: %v", err)
