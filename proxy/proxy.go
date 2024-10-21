@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"github.com/pquerna/cachecontrol"
 	"io"
 	"math/rand"
 	"net"
@@ -14,7 +13,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/armon/go-socks5"
 	"github.com/hashicorp/golang-lru/v2"
+	"github.com/pquerna/cachecontrol"
 	"golang.org/x/net/http2"
 	"golang.org/x/sync/semaphore"
 )
@@ -103,6 +104,15 @@ func (ha *HeaderAnonymizer) anonymizeHeaders(headers http.Header) http.Header {
 	cleaned.Set("Sec-Fetch-Mode", "navigate")
 
 	return cleaned
+}
+
+type ProxyServer struct {
+	HTTPHandler *ProxyHandler
+	SOCKSServer *socks5.Server
+	HTTPAddr    string
+	SOCKSAddr   string
+	Username    *string
+	Password    *string
 }
 
 type Blocklist struct {
@@ -255,6 +265,38 @@ type ProxyHandler struct {
 	sem              *semaphore.Weighted
 }
 
+func NewProxyServer(httpAddr, socksAddr string, timeoutSeconds int, username, password *string) (*ProxyServer, error) {
+	httpHandler := NewProxyHandler(timeoutSeconds)
+	httpHandler.Username = username
+	httpHandler.Password = password
+
+	socksConfig := &socks5.Config{
+		Dial: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return httpHandler.getConnection(ctx, addr)
+		},
+	}
+
+	if username != nil && password != nil {
+		socksConfig.Credentials = socks5.StaticCredentials{
+			*username: *password,
+		}
+	}
+
+	socksServer, err := socks5.New(socksConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create SOCKS5 server: %v", err)
+	}
+
+	return &ProxyServer{
+		HTTPHandler: httpHandler,
+		SOCKSServer: socksServer,
+		HTTPAddr:    httpAddr,
+		SOCKSAddr:   socksAddr,
+		Username:    username,
+		Password:    password,
+	}, nil
+}
+
 func NewProxyHandler(timeoutSeconds int) *ProxyHandler {
 	blocklist := NewBlocklist()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
@@ -291,7 +333,26 @@ func NewProxyHandler(timeoutSeconds int) *ProxyHandler {
 		sem:              semaphore.NewWeighted(5000),
 	}
 }
+func (ps *ProxyServer) Start() error {
+	errChan := make(chan error, 2)
 
+	go func() {
+		fmt.Printf("Starting HTTP proxy on %s\n", ps.HTTPAddr)
+		errChan <- http.ListenAndServe(ps.HTTPAddr, ps.HTTPHandler)
+	}()
+
+	go func() {
+		fmt.Printf("Starting SOCKS5 proxy on %s\n", ps.SOCKSAddr)
+		listener, err := net.Listen("tcp", ps.SOCKSAddr)
+		if err != nil {
+			errChan <- fmt.Errorf("failed to start SOCKS5 listener: %v", err)
+			return
+		}
+		errChan <- ps.SOCKSServer.Serve(listener)
+	}()
+
+	return <-errChan
+}
 func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !p.sem.TryAcquire(1) {
 		http.Error(w, "Too many concurrent connections", http.StatusServiceUnavailable)
@@ -382,7 +443,13 @@ func (p *ProxyHandler) getConnection(ctx context.Context, addr string) (net.Conn
 		Timeout:   p.Timeout,
 		KeepAlive: 30 * time.Second,
 	}
-	return dialer.DialContext(ctx, "tcp", addr)
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+
+	p.Pool.Put(addr, conn)
+	return conn, nil
 }
 
 func (p *ProxyHandler) handleHTTP(w http.ResponseWriter, req *http.Request) {
